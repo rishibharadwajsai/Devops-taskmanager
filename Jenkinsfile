@@ -4,7 +4,7 @@ pipeline {
     environment {
         DOCKER_IMAGE = 'task-manager-api'
         DOCKER_TAG = "${BUILD_NUMBER}"
-        JAVA_HOME = '/usr/lib/jvm/java-11-openjdk-amd64'
+        JAVA_HOME = '/usr/lib/jvm/java-21-openjdk-amd64'
         PATH = "/opt/maven/bin:${env.PATH}"
         JAR_FILE = 'task-manager-api-1.0.0.jar'
         APP_PORT = '8090'  // Using different port
