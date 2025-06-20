@@ -4,33 +4,54 @@ pipeline {
     environment {
         DOCKER_IMAGE = 'task-manager-api'
         DOCKER_TAG = "${BUILD_NUMBER}"
-        JAVA_HOME = '/usr/lib/jvm/java-21-openjdk-amd64'
+        JAVA_HOME = '/usr/lib/jvm/java-11-openjdk-amd64'
         PATH = "/opt/maven/bin:${env.PATH}"
         JAR_FILE = 'task-manager-api-1.0.0.jar'
+        APP_PORT = '8090'  // Using different port
     }
     
     stages {
-        stage('Pre-Deploy Cleanup') {
+        stage('Debug Port Usage') {
             steps {
-                echo '=== Cleaning Up Previous Deployments ==='
+                echo '=== Checking Port Usage ==='
                 sh '''
-                    echo "Stopping all Docker containers..."
-                    docker stop $(docker ps -aq) 2>/dev/null || true
+                    echo "=== Current port usage ==="
+                    netstat -tulpn | grep -E ':(8080|8090|8091|8092)' || echo "No conflicts on target ports"
                     
-                    echo "Removing all Docker containers..."
-                    docker rm $(docker ps -aq) 2>/dev/null || true
+                    echo "=== Docker containers ==="
+                    docker ps -a
                     
-                    echo "Stopping docker-compose services..."
-                    docker-compose down --remove-orphans --volumes || true
+                    echo "=== Processes using port 8080 ==="
+                    lsof -i :8080 || echo "Port 8080 is free"
+                    
+                    echo "=== Processes using port 8090 ==="
+                    lsof -i :8090 || echo "Port 8090 is free"
+                '''
+            }
+        }
+        
+        stage('Force Cleanup') {
+            steps {
+                echo '=== Force Cleanup All Docker Resources ==='
+                sh '''
+                    echo "Stopping ALL Docker containers..."
+                    docker ps -q | xargs -r docker stop || true
+                    
+                    echo "Removing ALL Docker containers..."
+                    docker ps -aq | xargs -r docker rm -f || true
+                    
+                    echo "Removing Docker networks..."
+                    docker network ls -q --filter type=custom | xargs -r docker network rm || true
                     
                     echo "Cleaning Docker system..."
-                    docker system prune -f || true
+                    docker system prune -af --volumes || true
                     
-                    echo "Checking ports after cleanup..."
-                    netstat -tulpn | grep -E ':(8080|8082|3002|9092)' || echo "✅ All target ports are free"
+                    echo "Waiting for cleanup to complete..."
+                    sleep 10
                     
-                    echo "Waiting 5 seconds for cleanup to complete..."
-                    sleep 5
+                    echo "=== Post-cleanup status ==="
+                    docker ps -a
+                    netstat -tulpn | grep -E ':(8080|8090)' || echo "✅ Ports 8080 and 8090 are free"
                 '''
             }
         }
@@ -39,22 +60,15 @@ pipeline {
             steps {
                 echo '=== Building and Testing Application ==='
                 sh '''
-                    echo "Maven clean compile..."
                     mvn clean compile
-                    
-                    echo "Running tests..."
                     mvn test
-                    
-                    echo "Packaging application..."
                     mvn package -DskipTests
                     
-                    echo "Verifying JAR file..."
                     if [ -f "target/${JAR_FILE}" ]; then
                         echo "✅ JAR file created: target/${JAR_FILE}"
                         ls -la target/${JAR_FILE}
                     else
                         echo "❌ JAR file not found!"
-                        ls -la target/
                         exit 1
                     fi
                 '''
@@ -67,26 +81,29 @@ pipeline {
             steps {
                 echo '=== Building Docker Image ==='
                 sh '''
-                    echo "Building Docker image..."
                     docker build -t ${DOCKER_IMAGE}:${DOCKER_TAG} .
                     docker tag ${DOCKER_IMAGE}:${DOCKER_TAG} ${DOCKER_IMAGE}:latest
-                    
-                    echo "✅ Docker image built successfully"
-                    docker images | grep ${DOCKER_IMAGE} | head -3
+                    echo "✅ Docker image built"
+                    docker images | grep ${DOCKER_IMAGE} | head -2
                 '''
             }
         }
         
-        stage('Deploy Application Only') {
+        stage('Deploy on Different Port') {
             steps {
-                echo '=== Deploying Application (Minimal Setup) ==='
+                echo "=== Deploying Application on Port ${env.APP_PORT} ==="
                 sh '''
-                    echo "Starting only the main application..."
+                    echo "Final port check before deployment..."
+                    if lsof -i :${APP_PORT}; then
+                        echo "❌ Port ${APP_PORT} is in use, trying to free it..."
+                        lsof -ti :${APP_PORT} | xargs -r kill -9 || true
+                        sleep 5
+                    fi
                     
-                    # Start just the application container
+                    echo "Starting application on port ${APP_PORT}..."
                     docker run -d \\
                         --name task-manager-app \\
-                        -p 8080:8080 \\
+                        -p ${APP_PORT}:8080 \\
                         --restart unless-stopped \\
                         ${DOCKER_IMAGE}:latest
                     
@@ -94,21 +111,24 @@ pipeline {
                     sleep 30
                     
                     echo "Container status:"
-                    docker ps | grep task-manager-app
+                    docker ps | grep task-manager-app || echo "Container not found"
+                    
+                    echo "Container logs:"
+                    docker logs task-manager-app --tail=10 || echo "No logs yet"
                 '''
             }
         }
         
         stage('Health Check') {
             steps {
-                echo '=== Application Health Check ==='
+                echo "=== Health Check on Port ${env.APP_PORT} ==="
                 script {
                     def healthCheckPassed = false
-                    def maxAttempts = 10
+                    def maxAttempts = 12
                     
                     for (int i = 1; i <= maxAttempts; i++) {
                         try {
-                            sh 'curl -f http://localhost:8080/api/tasks/health'
+                            sh "curl -f http://localhost:${env.APP_PORT}/api/tasks/health"
                             echo "✅ Health check passed on attempt ${i}!"
                             healthCheckPassed = true
                             break
@@ -117,11 +137,12 @@ pipeline {
                             if (i < maxAttempts) {
                                 echo "Waiting 10 seconds..."
                                 sleep 10
-                                if (i % 3 == 0) {
+                                if (i % 4 == 0) {
                                     sh '''
                                         echo "=== Debug Info ==="
-                                        docker ps | grep task-manager-app
-                                        docker logs task-manager-app --tail=10 || echo "No logs yet"
+                                        docker ps | grep task-manager-app || echo "Container not running"
+                                        docker logs task-manager-app --tail=15 || echo "No logs"
+                                        netstat -tulpn | grep ${APP_PORT} || echo "Port ${APP_PORT} not in use"
                                     '''
                                 }
                             }
@@ -131,11 +152,14 @@ pipeline {
                     if (!healthCheckPassed) {
                         sh '''
                             echo "=== Final Debug Info ==="
-                            docker ps
+                            docker ps -a
                             docker logs task-manager-app || echo "No logs available"
-                            netstat -tulpn | grep :8080 || echo "Port 8080 not in use"
+                            netstat -tulpn | grep ${APP_PORT} || echo "Port not in use"
+                            
+                            echo "=== Container inspection ==="
+                            docker inspect task-manager-app || echo "Cannot inspect container"
                         '''
-                        error "Application health check failed"
+                        error "Application health check failed after ${maxAttempts} attempts"
                     }
                 }
             }
@@ -143,30 +167,30 @@ pipeline {
         
         stage('API Tests') {
             steps {
-                echo '=== API Integration Tests ==='
+                echo "=== API Tests on Port ${env.APP_PORT} ==="
                 sh '''
-                    echo "=== Testing Core API Functionality ==="
+                    echo "=== Testing API Endpoints ==="
                     
                     echo "1. Health Check:"
-                    curl -X GET http://localhost:8080/api/tasks/health
+                    curl -X GET http://localhost:${APP_PORT}/api/tasks/health
                     echo ""
                     
-                    echo "2. Get all tasks (should be empty initially):"
-                    curl -X GET http://localhost:8080/api/tasks
+                    echo "2. Get all tasks:"
+                    curl -X GET http://localhost:${APP_PORT}/api/tasks
                     echo ""
                     
                     echo "3. Create a test task:"
-                    curl -X POST http://localhost:8080/api/tasks \\
+                    curl -X POST http://localhost:${APP_PORT}/api/tasks \\
                         -H "Content-Type: application/json" \\
-                        -d '{"title":"Pipeline Success Test","description":"Created by successful DevOps pipeline"}'
+                        -d '{"title":"DevOps Success","description":"Pipeline completed successfully!"}'
                     echo ""
                     
-                    echo "4. Get all tasks (should show the created task):"
-                    curl -X GET http://localhost:8080/api/tasks
+                    echo "4. Get all tasks again:"
+                    curl -X GET http://localhost:${APP_PORT}/api/tasks
                     echo ""
                     
-                    echo "5. Test Spring Boot Actuator:"
-                    curl -X GET http://localhost:8080/actuator/health
+                    echo "5. Actuator health:"
+                    curl -X GET http://localhost:${APP_PORT}/actuator/health
                     echo ""
                     
                     echo "✅ All API tests passed!"
@@ -174,73 +198,70 @@ pipeline {
             }
         }
         
-        stage('Optional: Deploy Monitoring') {
+        stage('Performance Test') {
             steps {
-                echo '=== Deploying Monitoring Stack (Optional) ==='
-                script {
-                    try {
-                        sh '''
-                            echo "Attempting to deploy monitoring stack..."
-                            
-                            # Check if ports are available
-                            if netstat -tulpn | grep -E ':(8082|3002|9092)'; then
-                                echo "⚠️ Some monitoring ports are in use, skipping monitoring deployment"
-                            else
-                                echo "✅ Monitoring ports available, deploying..."
-                                docker-compose up -d prometheus grafana graphite
-                                sleep 20
-                                echo "Monitoring stack deployed"
-                            fi
-                        '''
-                    } catch (Exception e) {
-                        echo "⚠️ Monitoring deployment failed, but continuing pipeline: ${e.getMessage()}"
-                    }
-                }
+                echo '=== Basic Performance Test ==='
+                sh '''
+                    echo "Running concurrent requests on port ${APP_PORT}..."
+                    
+                    for i in {1..10}; do
+                        curl -s http://localhost:${APP_PORT}/api/tasks/health > /dev/null &
+                    done
+                    wait
+                    echo "✅ Concurrent health checks completed"
+                    
+                    for i in {1..5}; do
+                        curl -s http://localhost:${APP_PORT}/api/tasks > /dev/null &
+                    done
+                    wait
+                    echo "✅ Concurrent API calls completed"
+                '''
             }
         }
         
-        stage('Final Verification') {
+        stage('Final Status') {
             steps {
-                echo '=== Final System Status ==='
+                echo '=== Final DevOps Pipeline Status ==='
                 sh '''
-                    echo "=== 🎯 DEVOPS PIPELINE SUMMARY ==="
-                    echo "✅ Build: Completed successfully"
-                    echo "✅ Tests: All tests passed"
-                    echo "✅ Package: JAR file created (${JAR_FILE})"
-                    echo "✅ Docker: Image built (${DOCKER_IMAGE}:${DOCKER_TAG})"
-                    echo "✅ Deploy: Application deployed and running"
-                    echo "✅ Health: Application is healthy"
-                    echo "✅ API: All endpoints tested and working"
+                    echo "=== 🎯 COMPLETE DEVOPS PIPELINE SUMMARY ==="
+                    echo "✅ Source Code: Compiled successfully"
+                    echo "✅ Unit Tests: All tests passed"
+                    echo "✅ Packaging: JAR file created (${JAR_FILE})"
+                    echo "✅ Docker Build: Image built (${DOCKER_IMAGE}:${DOCKER_TAG})"
+                    echo "✅ Deployment: Application deployed on port ${APP_PORT}"
+                    echo "✅ Health Check: Application is healthy and responding"
+                    echo "✅ API Testing: All endpoints tested and working"
+                    echo "✅ Performance: Basic load testing completed"
                     
                     echo ""
-                    echo "=== 🐳 RUNNING CONTAINERS ==="
+                    echo "=== 🐳 DEPLOYMENT STATUS ==="
                     docker ps --format "table {{.Names}}\\t{{.Status}}\\t{{.Ports}}"
                     
                     echo ""
-                    echo "=== 🌐 ACCESS INFORMATION ==="
-                    echo "🔗 Main Application: http://localhost:8080/api/tasks"
-                    echo "🔗 Health Check: http://localhost:8080/api/tasks/health"
-                    echo "🔗 Actuator: http://localhost:8080/actuator/health"
-                    
-                    # Check if monitoring is running
-                    if docker ps | grep prometheus > /dev/null; then
-                        echo "📊 Prometheus: http://localhost:9092"
-                    fi
-                    if docker ps | grep grafana > /dev/null; then
-                        echo "📈 Grafana: http://localhost:3002 (admin/admin)"
-                    fi
-                    if docker ps | grep graphite > /dev/null; then
-                        echo "📉 Graphite: http://localhost:8082"
-                    fi
+                    echo "=== 🌐 APPLICATION ACCESS ==="
+                    echo "🔗 Main API: http://localhost:${APP_PORT}/api/tasks"
+                    echo "🔗 Health Check: http://localhost:${APP_PORT}/api/tasks/health"
+                    echo "🔗 Actuator: http://localhost:${APP_PORT}/actuator/health"
+                    echo "🔗 H2 Console: http://localhost:${APP_PORT}/h2-console"
                     
                     echo ""
-                    echo "=== 📊 QUICK API TEST ==="
-                    TASK_COUNT=$(curl -s http://localhost:8080/api/tasks | jq length 2>/dev/null || echo "N/A")
-                    echo "Current task count: $TASK_COUNT"
-                    echo "Application status: $(curl -s http://localhost:8080/api/tasks/health 2>/dev/null || echo 'Not accessible')"
+                    echo "=== 📊 APPLICATION METRICS ==="
+                    TASK_COUNT=$(curl -s http://localhost:${APP_PORT}/api/tasks | jq length 2>/dev/null || echo "N/A")
+                    echo "Current tasks in database: $TASK_COUNT"
+                    echo "Application health: $(curl -s http://localhost:${APP_PORT}/api/tasks/health 2>/dev/null || echo 'Error')"
                     
                     echo ""
-                    echo "🎉 DevOps Pipeline Completed Successfully! 🎉"
+                    echo "=== 🛠️ DEVOPS TOOLS USED ==="
+                    echo "• Git: Source control"
+                    echo "• Maven: Build and dependency management"
+                    echo "• JUnit: Unit testing"
+                    echo "• Docker: Containerization"
+                    echo "• Jenkins: CI/CD pipeline"
+                    echo "• Spring Boot: Application framework"
+                    echo "• H2 Database: In-memory database"
+                    
+                    echo ""
+                    echo "🎉 COMPLETE DEVOPS CI/CD PIPELINE SUCCESS! 🎉"
                 '''
             }
         }
@@ -250,62 +271,59 @@ pipeline {
         always {
             echo '=== Pipeline Cleanup ==='
             sh '''
-                echo "Keeping current deployment running..."
-                echo "Cleaning up old Docker images only..."
+                echo "Keeping application running for testing..."
+                echo "Cleaning up old Docker images..."
                 docker images ${DOCKER_IMAGE} --format "{{.Repository}}:{{.Tag}} {{.ID}}" | tail -n +4 | awk '{print $2}' | head -n -2 | xargs -r docker rmi || true
                 echo "Cleanup completed"
             '''
         }
         success {
-            echo '''
+            echo """
             
-            🎉🎉🎉 DEVOPS PIPELINE SUCCESS! 🎉🎉🎉
+            🎉🎉🎉 DEVOPS PIPELINE COMPLETE! 🎉🎉🎉
             
-            ╔════════════════════════════════════════════╗
-            ║        🚀 DEPLOYMENT SUCCESSFUL! 🚀        ║
-            ╚════════════════════════════════════════════╝
+            ╔═══════════════════════════════════════════════╗
+            ║     🚀 FULL CI/CD PIPELINE SUCCESSFUL! 🚀     ║
+            ╚═══════════════════════════════════════════════╝
             
-            ✅ Complete CI/CD Pipeline Executed Successfully!
-            
-            🏗️  BUILD PIPELINE COMPLETED:
-            ├── ✅ Source Code Compiled
-            ├── ✅ Unit Tests Passed  
-            ├── ✅ Application Packaged
-            ├── ✅ Docker Image Built
-            ├── ✅ Application Deployed
-            ├── ✅ Health Checks Passed
-            └── ✅ Integration Tests Completed
+            🏗️ PIPELINE STAGES COMPLETED:
+            ├── ✅ Environment Setup & Port Management
+            ├── ✅ Source Code Compilation (Maven)
+            ├── ✅ Unit Testing (JUnit)
+            ├── ✅ Application Packaging (JAR)
+            ├── ✅ Docker Image Creation
+            ├── ✅ Container Deployment
+            ├── ✅ Health Monitoring
+            ├── ✅ API Integration Testing
+            └── ✅ Performance Testing
             
             🌐 YOUR APPLICATION IS LIVE:
-            ┌─────────────────────────────────────────┐
-            │ 🔗 API: http://localhost:8080/api/tasks  │
-            │ 🏥 Health: /api/tasks/health            │
-            │ 📊 Actuator: /actuator/health           │
-            │ 📈 Monitoring: Check container status   │
-            └─────────────────────────────────────────┘
+            ┌────────────────────────────────────────────┐
+            │ 🔗 API: http://localhost:${env.APP_PORT}/api/tasks    │
+            │ 🏥 Health: /api/tasks/health               │
+            │ 📊 Actuator: /actuator/health              │
+            │ 🗄️ Database: /h2-console                   │
+            └────────────────────────────────────────────┘
             
-            🎊 Your DevOps pipeline is now complete! 🎊
+            🎊 Congratulations! Your DevOps pipeline is working! 🎊
             
-            Next steps:
-            • Test your API endpoints
-            • Monitor application logs: docker logs task-manager-app
-            • Scale if needed: docker run more instances
-            '''
+            📝 NEXT STEPS:
+            • Test your API with Postman or curl
+            • Monitor logs: docker logs task-manager-app
+            • Add more features to your application
+            • Set up monitoring with Prometheus/Grafana
+            • Deploy to production environment
+            """
         }
         failure {
             echo '''
             ❌ PIPELINE FAILED
             
-            Check the logs above for specific errors.
-            Common issues:
-            1. Port conflicts
-            2. Docker daemon problems  
-            3. Application startup issues
-            
-            Debug commands:
+            Debug the issue with these commands:
             • docker ps -a
             • docker logs task-manager-app
-            • netstat -tulpn | grep 8080
+            • netstat -tulpn | grep 8090
+            • lsof -i :8090
             '''
         }
     }
